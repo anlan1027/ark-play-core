@@ -3,35 +3,47 @@ import assert from 'node:assert/strict';
 import {once} from 'node:events';
 import {setTimeout as delay} from 'node:timers/promises';
 import {WebSocketServer} from 'ws';
-import {GameClient} from '../src/rpc.mjs';
+import {createTools} from '../src/tools.mjs';
 
 const cs='a'.repeat(64);
 async function until(check) {
   const deadline=Date.now()+2000;
   while(!check()) {assert.ok(Date.now()<deadline,'timed out waiting for test event');await delay(5);}
 }
-async function fixture() {
+async function fixture({nativeView=false,onHello,onRequest}={}) {
   const server=new WebSocketServer({host:'127.0.0.1',port:0});await once(server,'listening');
   const received=[];let socket;
   const room={t:'room.state',code:'AB12',inMatch:false,content:{cs,vanilla:true}};
   server.on('connection',ws=>{
     socket=ws;ws.on('message',bytes=>{
       const m=JSON.parse(bytes);received.push(m);
-      if(m.t==='hello')ws.send(JSON.stringify({t:'welcome',rid:m.rid,version:1,playerId:'me',token:'test-session',resumed:true,content:{vanilla:cs}}));
+      if(m.t==='hello') {
+        ws.send(JSON.stringify({t:'welcome',rid:m.rid,version:1,playerId:'me',token:'test-session',resumed:true,content:{vanilla:cs}}));
+        onHello?.(m,ws);
+      }
       else {
+        if(onRequest?.(m,ws))return;
         if(m.t==='room.join')ws.send(JSON.stringify(room));
         ws.send(JSON.stringify({t:'ok',rid:m.rid}));
       }
     });
   });
-  const client=new GameClient({url:'ws://127.0.0.1:'+server.address().port,configFile:'/tmp/nonexistent-ark-event-test-config'});
+  const runtime=createTools({url:'ws://127.0.0.1:'+server.address().port,configFile:'/tmp/nonexistent-ark-event-test-config'});
+  const {client}=runtime;
   // Only scheduling/protocol behavior is under test; do not load or simulate a game.
-  client.site={ready:{},index:{cs},send(){},request:async()=>null,close:async()=>{}};
-  client.view=async()=>({phase:client.pub?.phase,round:client.pub?.round,terminal:!!client.result});
+  client.site={ready:{protocol:1,app:'0.3.1'},index:{cs},raw:{chess:{},tokens:{},items:{},bands:{}},send(){},
+    request:async op=>op==='map'?{field:'test',cells:[]}:null,close:async()=>{}};
+  if(!nativeView)client.view=async()=>({phase:client.pub?.phase,round:client.pub?.round,terminal:!!client.result});
   const push=message=>socket.send(JSON.stringify(message));
   const pub=(phase,extra={})=>push({t:'m.public',phase,round:0,players:[{playerId:'me',ready:false}],...extra});
-  const own=(extra={})=>push({t:'m.private',alive:true,ready:false,...extra});
-  return {client,received,push,pub,own,room,async close(){await client.close();for(const ws of server.clients)ws.terminate();await new Promise(resolve=>server.close(resolve));}};
+  const own=(extra={})=>push({t:'m.private',alive:true,ready:false,lp:100,funds:10,deployCap:3,deployCount:0,
+    shop:{level:1,upgradePrice:5,refreshPrice:2,freeRefreshes:0,slots:[]},hand:[null],board:[],temp:[],
+    bonds:[],effects:[],nextEnemies:[],stats:{},canReady:true,...extra});
+  const execute=(name,args,signal)=>{
+    const tool=runtime.tools.find(t=>t.name===name);
+    return tool.execute(tool.schema.parse(args),signal);
+  };
+  return {client,received,push,pub,own,room,execute,async close(){await runtime.close();for(const ws of server.clients)ws.terminate();await new Promise(resolve=>server.close(resolve));}};
 }
 function track(promise) {
   let settled=false;promise.then(()=>settled=true,()=>settled=true);
@@ -122,4 +134,132 @@ test('cancellation and disconnection clean listeners; a stale event version cann
     for(const ws of f.client.ws?[f.client.ws]:[])ws.terminate();
     await assert.rejects(pending.promise,/Connection lost/);assert.equal(f.client.stateWaiters.size,0);
   } finally {controller.abort();await f.close();await pending?.promise.catch(()=>{});}
+});
+
+const step=(type,args={})=>({action:{type,...args},reason:'test '+type});
+const intents=received=>received.filter(m=>m.t.startsWith('g.')).map(m=>m.t);
+
+test('stale revision returns the current native view without sending or applying actions',{timeout:10_000},async t=>{
+  const state={funds:10,accepted:[]};
+  const f=await fixture({nativeView:true,onRequest(m){
+    if(m.t.startsWith('g.')){state.accepted.push(m.t);state.funds--;}
+  }});t.after(()=>f.close());
+  await f.client.connect();f.push({...f.room,inMatch:true});f.pub('PREP');f.own();await f.client.quiet();
+  const revision=f.client.revision;
+  f.own({funds:12});state.funds=12;await f.client.quiet();
+  const before=structuredClone(state),steps=[step('refresh')];
+  const result=await f.client.call({op:'act',revision,steps});
+  assert.equal(result.error,'STALE_CLIENT_SNAPSHOT');assert.deepEqual(result.executed,[]);
+  assert.equal(result.view.revision,f.client.revision);assert.ok(result.view.revision>revision);
+  assert.equal(result.view.me.funds,12);assert.equal(result.view.canAct,true);
+  const output=await f.execute('ark_act',{revision,steps});
+  assert.match(output.text,/STALE_CLIENT_SNAPSHOT/);assert.match(output.text,/钱12/);
+  assert.deepEqual(intents(f.received),[]);assert.deepEqual(state,before);
+});
+
+for(const toolOutput of [false,true])test('second-step rejection preserves partial success in '+(toolOutput?'tool text':'structured results'),{timeout:10_000},async t=>{
+  const state={funds:10,accepted:[]},detail={slot:0};
+  const f=await fixture({nativeView:true,onRequest(m,ws){
+    if(m.t==='g.refresh') {
+      state.accepted.push(m.t);state.funds-=2;f.own({funds:state.funds});
+      ws.send(JSON.stringify({t:'ok',rid:m.rid}));return true;
+    }
+    if(m.t==='g.buy'){ws.send(JSON.stringify({t:'error',rid:m.rid,code:'INVALID_SLOT',detail}));return true;}
+  }});t.after(()=>f.close());
+  await f.client.connect();f.push({...f.room,inMatch:true});f.pub('PREP');f.own();await f.client.quiet();
+  const steps=[step('refresh'),step('buy',{slot:0}),step('levelUp')];
+  const args={revision:f.client.revision,steps};
+  if(toolOutput) {
+    const {text}=await f.execute('ark_act',args);
+    assert.match(text,/✓ refresh test refresh/);assert.match(text,/✗ buy test buy.*INVALID_SLOT/);
+    assert.doesNotMatch(text,/[✓✗] levelUp/);assert.doesNotMatch(text,/✓ buy|没有执行任何动作/);
+    assert.match(text,/钱8/);
+  }else {
+    const result=await f.client.call({op:'act',...args});
+    assert.deepEqual(result.executed,[{...steps[0],accepted:true},{...steps[1],accepted:false,result:{error:'INVALID_SLOT',detail}}]);
+    assert.equal(result.view.me.funds,8);
+  }
+  assert.deepEqual(intents(f.received),['g.refresh','g.buy']);
+  assert.deepEqual(state,{funds:8,accepted:['g.refresh']});assert.equal(f.client.uncertain,false);
+});
+
+// Resume the same synthetic server session with its authoritative post-action
+// balance. The first buy is applied but its state push is deliberately withheld.
+async function disconnectedAction(t,afterAck=false) {
+  const state={funds:10,accepted:[]};
+  const f=await fixture({nativeView:true,onHello(){
+    f.push({...f.room,inMatch:true});f.pub('PREP');f.own({funds:state.funds});
+  },onRequest(m,ws){
+    if(m.t==='g.buy') {
+      state.accepted.push(m.t);state.funds-=3;
+      if(afterAck)ws.send(JSON.stringify({t:'ok',rid:m.rid}));else ws.terminate();
+      return true;
+    }
+    if(m.t==='g.refresh') {
+      state.accepted.push(m.t);state.funds-=2;f.own({funds:state.funds});
+      ws.send(JSON.stringify({t:'ok',rid:m.rid}));return true;
+    }
+  }});t.after(()=>f.close());
+  await f.client.connect();const revision=f.client.revision;
+  let ackReceived=false;
+  if(afterAck)f.client.ws.once('message',bytes=>{
+    assert.equal(JSON.parse(bytes).t,'ok');ackReceived=true;
+    // receive() has already consumed the ack and removed its pending request.
+    f.client.ws.terminate();
+  });
+  await assert.rejects(f.execute('ark_act',{revision,steps:[step('buy',{slot:0})]}),/Connection lost.*ark_view/);
+  assert.equal(ackReceived,afterAck);
+  assert.deepEqual(intents(f.received),['g.buy']);assert.deepEqual(state,{funds:7,accepted:['g.buy']});
+  return {...f,state,revision};
+}
+
+for(const afterAck of [false,true])test('disconnect '+(afterAck?'after':'before')+' acknowledgement requires ark_view and never replays the accepted action',{timeout:10_000},async t=>{
+  const f=await disconnectedAction(t,afterAck);
+  assert.equal(f.client.uncertain,true);assert.equal(f.client.pending.size,0);
+  await assert.rejects(f.execute('ark_act',{revision:f.client.revision,steps:[step('refresh')]}),/Use ark_view.*uncertain/);
+  assert.equal(f.client.uncertain,true);assert.deepEqual(intents(f.received),['g.buy']);
+  assert.deepEqual(f.state,{funds:7,accepted:['g.buy']});
+  const hellos=f.received.filter(m=>m.t==='hello');assert.equal(hellos.length,2);
+  assert.equal(hellos[1].token,'test-session');
+});
+
+test('ark_view keeps protection until the authoritative view completes, then accepts only a current revision',{timeout:10_000},async t=>{
+  const f=await disconnectedAction(t),mapping=Promise.withResolvers(),started=Promise.withResolvers();
+  const request=f.client.site.request;
+  f.client.site.request=async(op,payload)=>{
+    if(op==='map'){started.resolve(payload);await mapping.promise;}
+    return request(op,payload);
+  };
+  const recovery=track(f.client.call({op:'view'}));
+  try {
+    const snapshot=await started.promise;
+    assert.equal(snapshot.own.funds,7);assert.equal(recovery.settled,false);assert.equal(f.client.uncertain,true);
+    await assert.rejects(f.execute('ark_act',{revision:f.client.revision,steps:[step('refresh')]}),/One gameplay call at a time/);
+    assert.deepEqual(intents(f.received),['g.buy']);
+    mapping.resolve();const result=await recovery.promise;
+    assert.equal(result.view.me.funds,7);assert.equal(result.view.revision,f.client.revision);
+    assert.ok(result.view.revision>f.revision);assert.equal(f.client.uncertain,false);
+    const stale=await f.execute('ark_act',{revision:f.revision,steps:[step('refresh')]});
+    assert.match(stale.text,/STALE_CLIENT_SNAPSHOT/);assert.deepEqual(intents(f.received),['g.buy']);
+    const output=await f.execute('ark_act',{revision:result.view.revision,steps:[step('refresh')]});
+    assert.match(output.text,/✓ refresh/);assert.match(output.text,/钱5/);
+    assert.deepEqual(intents(f.received),['g.buy','g.refresh']);assert.deepEqual(f.state,{funds:5,accepted:['g.buy','g.refresh']});
+  }finally{mapping.resolve();await recovery.promise.catch(()=>{});}
+});
+
+test('a failed ark_view retains uncertainty until a successful retry without replaying actions',{timeout:10_000},async t=>{
+  const f=await disconnectedAction(t),request=f.client.site.request;
+  f.client.site.request=async(op,payload)=>{
+    if(op==='map')throw new Error('fixture map unavailable');
+    return request(op,payload);
+  };
+  await assert.rejects(f.execute('ark_view',{}),/fixture map unavailable/);
+  assert.equal(f.client.uncertain,true);
+  await assert.rejects(f.execute('ark_act',{revision:f.client.revision,steps:[step('refresh')]}),/Use ark_view.*uncertain/);
+  assert.deepEqual(intents(f.received),['g.buy']);assert.deepEqual(f.state,{funds:7,accepted:['g.buy']});
+  f.client.site.request=request;
+  const restored=await f.execute('ark_view',{});assert.match(restored.text,/钱7/);
+  assert.equal(f.client.uncertain,false);
+  await f.execute('ark_act',{revision:f.client.revision,steps:[step('refresh')]});
+  assert.deepEqual(intents(f.received),['g.buy','g.refresh']);assert.deepEqual(f.state,{funds:5,accepted:['g.buy','g.refresh']});
 });

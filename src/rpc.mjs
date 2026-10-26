@@ -151,7 +151,11 @@ export class GameClient {
       if(this.result)return;
       if(this.roomClosed)throw new Error('Room closed: '+this.roomClosed+'; waiting stopped. Do not poll or automatically rejoin');
       if(this.siteError)throw new Error(this.siteError+'; recover with ark_view, do not repeat accepted actions');
-      if(!this.ws||this.ws.readyState!==WebSocket.OPEN)throw new Error('Connection lost during settlement; recover with ark_view, do not repeat accepted actions');
+      if(!this.ws||this.ws.readyState!==WebSocket.OPEN) {
+        // An acknowledged action may still be waiting for its state push.
+        this.uncertain=true;
+        throw new Error('Connection lost during settlement; recover with ark_view, do not repeat accepted actions');
+      }
       // A ready acknowledgement may precede its state push. Never return the
       // old prep snapshot as if it were a new opportunity to buy or ready.
       const oldPrep=readyRound!==undefined&&this.pub?.round===readyRound&&
